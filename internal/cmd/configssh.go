@@ -8,16 +8,17 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
-	"cdr.dev/coder-cli/pkg/clog"
-
+	"github.com/cli/safeexec"
 	"github.com/spf13/cobra"
 	"golang.org/x/xerrors"
 
 	"cdr.dev/coder-cli/coder-sdk"
 	"cdr.dev/coder-cli/internal/coderutil"
+	"cdr.dev/coder-cli/pkg/clog"
 )
 
 const sshStartToken = "# ------------START-CODER-ENTERPRISE-----------"
@@ -132,7 +133,7 @@ func configSSH(configpath *string, remove *bool, next *bool) func(cmd *cobra.Com
 			}
 		}
 
-		binPath, err := os.Executable()
+		binPath, err := binPath()
 		if err != nil {
 			return xerrors.Errorf("Failed to get executable path: %w", err)
 		}
@@ -163,6 +164,52 @@ func configSSH(configpath *string, remove *bool, next *bool) func(cmd *cobra.Com
 		fmt.Printf("For example, try running\n\n\t$ ssh coder.%s\n\n", workspaces[0].Name)
 		return nil
 	}
+}
+
+// binPath returns the path to the coder binary suitable for use in ssh
+// ProxyCommand.
+func binPath() (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", xerrors.Errorf("get executable path: %w", err)
+	}
+
+	// On Windows, the coder-cli executable must be in $PATH for both Msys2/Git
+	// Bash and OpenSSH for Windows (used by Powershell and VS Code) to function
+	// correctly. Check if the current executable is in $PATH, and warn the user
+	// if it isn't.
+	if runtime.GOOS == "windows" {
+		binName := filepath.Base(exePath)
+		// We use safeexec instead of os/exec because os/exec returns paths in
+		// the current working directory, which we will run into very often when
+		// looking for our own path.
+		pathPath, err := safeexec.LookPath(binName)
+		if err != nil {
+			clog.LogWarn(
+				"The current executable is not in $PATH.",
+				"This may lead to problems connecting to your workspace via SSH.",
+				fmt.Sprintf("Please move %q to a location in your $PATH (such as System32) and run `%s config-ssh` again.", binName, binName),
+			)
+			// Return the exePath so SSH at least works outside of Msys2.
+			return exePath, nil
+		}
+
+		// Warn the user if the current executable is not the same as the one in
+		// $PATH.
+		if filepath.Clean(pathPath) != filepath.Clean(exePath) {
+			clog.LogWarn(
+				"The current executable path does not match the executable path found in $PATH.",
+				"This may lead to problems connecting to your workspace via SSH.",
+				fmt.Sprintf("\t Current executable path: %q", exePath),
+				fmt.Sprintf("\tExecutable path in $PATH: %q", pathPath),
+			)
+		}
+
+		return binName, nil
+	}
+
+	// On platforms other than Windows we can use the full path to the binary.
+	return exePath, nil
 }
 
 // removeOldConfig removes the old ssh configuration from the user's sshconfig.
@@ -230,7 +277,7 @@ func makeSSHConfig(binPath, host, userName, workspaceName, privateKeyFilepath st
 		return fmt.Sprintf(
 			`Host coder.%s
    HostName coder.%s
-   ProxyCommand %s tunnel %s 12213 stdio
+   ProxyCommand "%s" tunnel %s 12213 stdio
    StrictHostKeyChecking no
    ConnectTimeout=0
    IdentitiesOnly yes
