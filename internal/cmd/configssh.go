@@ -6,8 +6,10 @@ import (
 	"io/ioutil"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -132,8 +134,11 @@ func configSSH(configpath *string, remove *bool, next *bool) func(cmd *cobra.Com
 			}
 		}
 
-		binPath, err := os.Executable()
+		binPath, err := binPath()
 		if err != nil {
+			if runtime.GOOS == "windows" {
+				return xerrors.Errorf("Failed to ensure `coder` is in $PATH, please move the `coder` binary to a location in $PATH (such as System32): %w", err)
+			}
 			return xerrors.Errorf("Failed to get executable path: %w", err)
 		}
 
@@ -163,6 +168,42 @@ func configSSH(configpath *string, remove *bool, next *bool) func(cmd *cobra.Com
 		fmt.Printf("For example, try running\n\n\t$ ssh coder.%s\n\n", workspaces[0].Name)
 		return nil
 	}
+}
+
+// binPath returns the path to the coder binary suitable for use in ssh
+// ProxyCommand.
+func binPath() (string, error) {
+	exePath, err := os.Executable()
+	if err != nil {
+		return "", xerrors.Errorf("get executable path: %w", err)
+	}
+
+	// On Windows, the coder-cli executable must be in $PATH for Msys2 and Git
+	// Bash to function correctly. To prevent weird behavior when people switch
+	// between the two, we require this for all users.
+	if runtime.GOOS == "windows" {
+		binName := filepath.Base(exePath)
+		pathPath, err := exec.LookPath(exePath)
+		if err != nil {
+			return "", xerrors.Errorf("locate %q in $PATH: %w", binName, err)
+		}
+
+		// Warn the user if the current executable is not the same as the one in
+		// $PATH.
+		if filepath.Clean(pathPath) != filepath.Clean(exePath) {
+			clog.LogWarn(
+				"The current executable path does not match the executable path found in $PATH.",
+				"This may lead to problems connecting to your workspace via SSH.",
+				fmt.Sprintf("\t Current executable path: %q", exePath),
+				fmt.Sprintf("\tExecutable path in $PATH: %q", pathPath),
+			)
+		}
+
+		return binName, nil
+	}
+
+	// On platforms other than Windows we can use the full path to the binary.
+	return exePath, nil
 }
 
 // removeOldConfig removes the old ssh configuration from the user's sshconfig.
@@ -230,7 +271,7 @@ func makeSSHConfig(binPath, host, userName, workspaceName, privateKeyFilepath st
 		return fmt.Sprintf(
 			`Host coder.%s
    HostName coder.%s
-   ProxyCommand %s tunnel %s 12213 stdio
+   ProxyCommand "%s" tunnel %s 12213 stdio
    StrictHostKeyChecking no
    ConnectTimeout=0
    IdentitiesOnly yes
